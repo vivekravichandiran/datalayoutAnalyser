@@ -2522,24 +2522,32 @@ results = run_analysis(config)
 
 # DBTITLE 1,Results Summary DataFrame
 # Create and display results as a DataFrame
-if results:
-    report_df = create_report_dataframe(results)
-    display(report_df)
-else:
-    print("No results to display")
+# Note: Run the "Run Analysis" cell first to populate results
+try:
+    if results:
+        report_df = create_report_dataframe(results)
+        display(report_df)
+    else:
+        print("No results to display - analysis returned empty")
+except NameError:
+    print("⚠️ No results available. Please run the 'Run Analysis' cell first.")
 
 # COMMAND ----------
 
 # DBTITLE 1,Issues Detail DataFrame
 # Display detailed issues
-if results:
-    issues_df = create_issues_dataframe(results)
-    if issues_df.count() > 0:
-        display(issues_df)
+# Note: Run the "Run Analysis" cell first to populate results
+try:
+    if results:
+        issues_df = create_issues_dataframe(results)
+        if issues_df.count() > 0:
+            display(issues_df)
+        else:
+            print("✅ No issues detected - all tables are healthy!")
     else:
-        print("No issues detected - all tables are healthy!")
-else:
-    print("No results to display")
+        print("No results to display - analysis returned empty")
+except NameError:
+    print("⚠️ No results available. Please run the 'Run Analysis' cell first.")
 
 # COMMAND ----------
 
@@ -2550,20 +2558,29 @@ else:
 
 # DBTITLE 1,Generated SQL Commands
 # Display all generated optimization SQL commands
+# Note: Run the "Run Analysis" cell first to populate results
 print("=" * 60)
 print("GENERATED OPTIMIZATION SQL COMMANDS")
 print("=" * 60 + "\n")
 
-for r in results:
-    if r.sql_commands:
-        print(f"-- Table: {r.full_name}")
-        print(f"-- Health Status: {r.health_status}")
-        for cmd in r.sql_commands:
-            print(cmd)
-        print()
-
-if not any(r.sql_commands for r in results):
-    print("No optimization commands generated - tables are well optimized!")
+try:
+    if results:
+        has_commands = False
+        for r in results:
+            if r.sql_commands:
+                has_commands = True
+                print(f"-- Table: {r.full_name}")
+                print(f"-- Health Status: {r.health_status}")
+                for cmd in r.sql_commands:
+                    print(cmd)
+                print()
+        
+        if not has_commands:
+            print("✅ No optimization commands generated - tables are well optimized!")
+    else:
+        print("No results to display - analysis returned empty")
+except NameError:
+    print("⚠️ No results available. Please run the 'Run Analysis' cell first.")
 
 # COMMAND ----------
 
