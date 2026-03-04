@@ -6,15 +6,17 @@
 # MAGIC This production-grade notebook analyzes Delta table storage layout and history to generate optimization recommendations.
 # MAGIC 
 # MAGIC **Features:**
-# MAGIC - Analyzes file layout and detects small files
-# MAGIC - Detects partition skew and file size skew
+# MAGIC - Analyzes file layout and detects small files with percentage breakdown
+# MAGIC - Detects partition skew and file size skew with severity levels
 # MAGIC - Analyzes Delta history for OPTIMIZE, VACUUM, and MERGE operations
+# MAGIC - Checks for Liquid Clustering on smaller tables
+# MAGIC - Validates partitioning strategy for large tables
 # MAGIC - Generates actionable optimization recommendations
 # MAGIC - Supports Unity Catalog tables (managed and external)
 # MAGIC - Scales to thousands of tables
 # MAGIC 
 # MAGIC **Author:** Databricks Platform Engineering  
-# MAGIC **Version:** 1.0.0
+# MAGIC **Version:** 2.0.0
 
 # COMMAND ----------
 
@@ -51,9 +53,18 @@ class AnalyzerConfig:
     file_skew_threshold: float = 10.0
     partition_skew_threshold: float = 10.0
     
+    # Skew severity thresholds
+    skew_low_threshold: float = 3.0
+    skew_medium_threshold: float = 5.0
+    skew_high_threshold: float = 10.0
+    
+    # Small files percentage thresholds
+    small_files_pct_warning: float = 20.0  # Warning if >20% small files
+    small_files_pct_critical: float = 50.0  # Critical if >50% small files
+    
     # Health check thresholds
     max_partition_count: int = 5000
-    large_table_threshold_gb: int = 1000  # 1TB
+    large_table_threshold_gb: int = 1000  # 1TB - tables above this need partitioning
     zorder_recommend_threshold_gb: int = 500
     optimize_stale_days: int = 30
     vacuum_stale_days: int = 30
@@ -116,10 +127,12 @@ print("=" * 60)
 
 # DBTITLE 1,Import Dependencies
 import logging
+import re
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from functools import reduce
+from enum import Enum
 import json
 import statistics
 
@@ -127,7 +140,7 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, 
-    DoubleType, ArrayType, TimestampType, IntegerType
+    DoubleType, ArrayType, TimestampType, IntegerType, BooleanType
 )
 from delta.tables import DeltaTable
 
@@ -140,6 +153,53 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("DeltaLayoutAnalyzer")
+
+# COMMAND ----------
+
+# DBTITLE 1,Enums and Data Classes for Issues
+class IssueSeverity(Enum):
+    """Severity levels for detected issues."""
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class IssueCategory(Enum):
+    """Categories of issues detected."""
+    SMALL_FILES = "small_files"
+    FILE_SKEW = "file_skew"
+    PARTITION_SKEW = "partition_skew"
+    STALE_OPTIMIZE = "stale_optimize"
+    STALE_VACUUM = "stale_vacuum"
+    EXCESS_PARTITIONS = "excess_partitions"
+    NO_PARTITIONING = "no_partitioning"
+    NO_LIQUID_CLUSTERING = "no_liquid_clustering"
+    NO_ZORDER = "no_zorder"
+
+
+@dataclass
+class TableIssue:
+    """A detected issue with a Delta table."""
+    issue_id: str
+    category: str
+    severity: str
+    title: str
+    details: str
+    current_value: str
+    threshold: str
+    recommendation: str
+    sql_command: Optional[str] = None
+
+
+class HealthStatus(Enum):
+    """Overall health status of a table."""
+    HEALTHY = "healthy"
+    NEEDS_ATTENTION = "needs_attention"  
+    WARNING = "warning"
+    CRITICAL = "critical"
+    ERROR = "error"
 
 # COMMAND ----------
 
@@ -181,6 +241,18 @@ def format_timestamp(ts) -> Optional[str]:
     return str(ts)
 
 
+def days_ago_str(days: Optional[int]) -> str:
+    """Format days ago as human-readable string."""
+    if days is None:
+        return "Never"
+    elif days == 0:
+        return "Today"
+    elif days == 1:
+        return "Yesterday"
+    else:
+        return f"{days} days ago"
+
+
 def calculate_percentile(values: List[float], percentile: float) -> float:
     """Calculate percentile of a list of values."""
     if not values:
@@ -195,6 +267,26 @@ def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> f
     if denominator == 0:
         return default
     return numerator / denominator
+
+
+def get_skew_severity(skew_ratio: float, config: AnalyzerConfig) -> str:
+    """
+    Determine skew severity based on ratio.
+    
+    Logic:
+    - skew_ratio <= 3.0: NONE (no significant skew)
+    - skew_ratio <= 5.0: LOW (minor skew, monitor)
+    - skew_ratio <= 10.0: MEDIUM (moderate skew, consider action)
+    - skew_ratio > 10.0: HIGH (significant skew, action required)
+    """
+    if skew_ratio <= config.skew_low_threshold:
+        return IssueSeverity.NONE.value
+    elif skew_ratio <= config.skew_medium_threshold:
+        return IssueSeverity.LOW.value
+    elif skew_ratio <= config.skew_high_threshold:
+        return IssueSeverity.MEDIUM.value
+    else:
+        return IssueSeverity.HIGH.value
 
 # COMMAND ----------
 
@@ -385,121 +477,161 @@ def collect_table_metadata(catalog: str, schema: str, table: str) -> Dict[str, A
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. File Layout Analysis
+# MAGIC ## 5. Liquid Clustering Detection
 
 # COMMAND ----------
 
-# DBTITLE 1,File Layout Analysis Functions
-def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, Any]:
+# DBTITLE 1,Liquid Clustering Detection
+def detect_liquid_clustering(catalog: str, schema: str, table: str) -> Dict[str, Any]:
     """
-    Analyze file layout metrics for a Delta table using Delta log metadata.
+    Detect if a table uses Liquid Clustering by checking SHOW CREATE TABLE output.
     
-    This function uses Delta Lake's internal metadata to analyze file sizes
-    without scanning the actual data files, making it efficient for large tables.
+    Liquid Clustering is identified by the presence of CLUSTER BY clause in the DDL.
+    
+    Logic:
+    - Execute SHOW CREATE TABLE
+    - Parse the DDL for 'CLUSTER BY' clause
+    - Extract clustering columns if present
     
     Args:
-        table_path: Path to the Delta table
-        config: Analyzer configuration
+        catalog: Catalog name
+        schema: Schema name
+        table: Table name
         
     Returns:
-        Dictionary containing file layout statistics
+        Dictionary with liquid clustering information
     """
+    full_name = f"{catalog}.{schema}.{table}"
     result = {
-        "total_files": 0,
-        "total_size_bytes": 0,
-        "avg_file_size_bytes": 0,
-        "avg_file_size_mb": 0.0,
-        "median_file_size_mb": 0.0,
-        "min_file_size_mb": 0.0,
-        "max_file_size_mb": 0.0,
-        "std_dev_mb": 0.0,
-        "small_files_count": 0,
-        "small_files_pct": 0.0,
-        "severe_small_files_count": 0,
-        "severe_small_files_pct": 0.0,
-        "optimal_files_count": 0,
-        "optimal_files_pct": 0.0,
-        "file_sizes": [],
+        "is_liquid_clustered": False,
+        "clustering_columns": [],
+        "ddl": None,
         "error": None
     }
     
     try:
-        # Use Delta table's file metadata from the transaction log
-        delta_table = DeltaTable.forPath(spark, table_path)
+        # Get the CREATE TABLE statement
+        ddl_df = spark.sql(f"SHOW CREATE TABLE {full_name}")
+        ddl_row = ddl_df.first()
         
-        # Get add files from the Delta log (metadata only, no data scan)
-        files_df = delta_table.toDF()
-        
-        # Get file statistics from input_file_name() and metadata
-        # This approach uses the Delta transaction log
-        detail_df = spark.sql(f"DESCRIBE DETAIL delta.`{table_path}`")
-        detail_row = detail_df.first()
-        
-        num_files = detail_row.numFiles if detail_row else 0
-        total_size = detail_row.sizeInBytes if detail_row else 0
-        
-        if num_files == 0:
-            return result
-        
-        # Calculate average file size
-        avg_size_bytes = total_size / num_files if num_files > 0 else 0
-        avg_size_mb = bytes_to_mb(avg_size_bytes)
-        
-        result.update({
-            "total_files": num_files,
-            "total_size_bytes": total_size,
-            "avg_file_size_bytes": avg_size_bytes,
-            "avg_file_size_mb": avg_size_mb,
-        })
-        
-        # For detailed file analysis, we need to read the Delta log
-        # Use _delta_log to get actual file sizes
-        file_stats = get_file_stats_from_delta_log(table_path)
-        
-        if file_stats:
-            file_sizes_mb = [bytes_to_mb(s) for s in file_stats]
+        if ddl_row:
+            ddl = ddl_row[0] if isinstance(ddl_row[0], str) else str(ddl_row[0])
+            result["ddl"] = ddl
             
-            result.update({
-                "file_sizes": file_stats,
-                "median_file_size_mb": round(statistics.median(file_sizes_mb), 2) if file_sizes_mb else 0.0,
-                "min_file_size_mb": round(min(file_sizes_mb), 2) if file_sizes_mb else 0.0,
-                "max_file_size_mb": round(max(file_sizes_mb), 2) if file_sizes_mb else 0.0,
-                "std_dev_mb": round(statistics.stdev(file_sizes_mb), 2) if len(file_sizes_mb) > 1 else 0.0,
-            })
+            # Check for CLUSTER BY clause (Liquid Clustering)
+            # Pattern matches: CLUSTER BY (col1, col2) or CLUSTER BY col1
+            cluster_pattern = r'CLUSTER\s+BY\s*\(([^)]+)\)|CLUSTER\s+BY\s+(\w+)'
+            match = re.search(cluster_pattern, ddl, re.IGNORECASE)
             
-            # Categorize files by size
-            severe_threshold = config.small_file_severe_mb * 1024 * 1024
-            acceptable_threshold = config.small_file_acceptable_mb * 1024 * 1024
-            optimal_min = config.optimal_file_size_min_mb * 1024 * 1024
-            optimal_max = config.optimal_file_size_max_mb * 1024 * 1024
-            
-            severe_count = sum(1 for s in file_stats if s < severe_threshold)
-            small_count = sum(1 for s in file_stats if s < acceptable_threshold)
-            optimal_count = sum(1 for s in file_stats if optimal_min <= s <= optimal_max)
-            
-            result.update({
-                "severe_small_files_count": severe_count,
-                "severe_small_files_pct": round(100 * severe_count / len(file_stats), 2) if file_stats else 0.0,
-                "small_files_count": small_count,
-                "small_files_pct": round(100 * small_count / len(file_stats), 2) if file_stats else 0.0,
-                "optimal_files_count": optimal_count,
-                "optimal_files_pct": round(100 * optimal_count / len(file_stats), 2) if file_stats else 0.0,
-            })
-        
-        logger.info(f"Analyzed file layout: {num_files} files, avg size: {result['avg_file_size_mb']} MB")
+            if match:
+                result["is_liquid_clustered"] = True
+                # Extract column names
+                cols_str = match.group(1) or match.group(2)
+                if cols_str:
+                    # Parse column names, handling quotes and spaces
+                    cols = [col.strip().strip('`"\'') for col in cols_str.split(',')]
+                    result["clustering_columns"] = [c for c in cols if c]
+                    
+        logger.info(f"Liquid clustering check for {full_name}: {result['is_liquid_clustered']}")
         
     except Exception as e:
         result["error"] = str(e)
-        logger.error(f"Error analyzing file layout for {table_path}: {e}")
+        logger.debug(f"Could not check liquid clustering for {full_name}: {e}")
     
     return result
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. File Layout Analysis
+
+# COMMAND ----------
+
+# DBTITLE 1,File Layout Analysis Functions
+def get_file_sizes_from_dbutils(table_path: str, sample_size: int = 50000) -> Tuple[List[int], List[Dict[str, Any]]]:
+    """
+    Get file sizes using dbutils.fs.ls for accurate file size information.
+    
+    This is the most reliable way to get actual file sizes from the Delta table location.
+    dbutils.fs.ls returns FileInfo objects with path, name, size, and modificationTime.
+    
+    Example FileInfo:
+        FileInfo(path='s3://bucket/table/part-00000.parquet', 
+                 name='part-00000.parquet', 
+                 size=46804904, 
+                 modificationTime=1772614999000)
+    
+    Args:
+        table_path: Path to Delta table location
+        sample_size: Maximum number of files to process (for very large tables)
+        
+    Returns:
+        Tuple of (list of file sizes in bytes, list of file info dicts)
+    """
+    file_sizes = []
+    file_infos = []
+    
+    try:
+        # Use dbutils.fs.ls to list all files in the table location
+        all_files = dbutils.fs.ls(table_path)
+        
+        # Process files recursively (for partitioned tables)
+        files_to_process = list(all_files)
+        parquet_files = []
+        
+        # Iterate through directories to find all parquet files
+        while files_to_process:
+            current = files_to_process.pop(0)
+            
+            # Skip _delta_log directory and other metadata
+            if current.name.startswith('_'):
+                continue
+            
+            # If it's a directory (partitioned tables), list its contents
+            if current.name.endswith('/'):
+                try:
+                    sub_files = dbutils.fs.ls(current.path)
+                    files_to_process.extend(sub_files)
+                except Exception:
+                    pass
+            # If it's a parquet file, add to our list
+            elif current.name.endswith('.parquet'):
+                parquet_files.append(current)
+                
+                # Stop if we've collected enough files for sampling
+                if len(parquet_files) >= sample_size:
+                    break
+        
+        # Extract sizes and info from parquet files
+        for file_info in parquet_files:
+            file_sizes.append(file_info.size)
+            file_infos.append({
+                "path": file_info.path,
+                "name": file_info.name,
+                "size": file_info.size,
+                "size_mb": bytes_to_mb(file_info.size),
+                "modification_time": file_info.modificationTime
+            })
+        
+        logger.info(f"Retrieved {len(file_sizes)} file sizes from {table_path} using dbutils.fs.ls")
+        
+    except NameError:
+        # dbutils not available (running outside Databricks)
+        logger.warning("dbutils not available - falling back to Delta log parsing")
+        return [], []
+    except Exception as e:
+        logger.warning(f"Error using dbutils.fs.ls for {table_path}: {e}")
+        return [], []
+    
+    return file_sizes, file_infos
 
 
 def get_file_stats_from_delta_log(table_path: str, sample_size: int = 10000) -> List[int]:
     """
-    Extract file sizes from Delta transaction log.
+    Extract file sizes from Delta transaction log (fallback method).
     
     This reads the Delta log JSON files to get file sizes without scanning data.
+    Used as a fallback when dbutils.fs.ls is not available.
     
     Args:
         table_path: Path to Delta table
@@ -535,10 +667,135 @@ def get_file_stats_from_delta_log(table_path: str, sample_size: int = 10000) -> 
     
     return file_sizes
 
+
+def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, Any]:
+    """
+    Analyze file layout metrics for a Delta table.
+    
+    This function uses dbutils.fs.ls to get accurate individual file sizes,
+    then calculates comprehensive statistics including:
+    - Average, median, min, max file sizes
+    - Standard deviation
+    - Small files percentage
+    - File size skew analysis
+    
+    Logic:
+    1. Use dbutils.fs.ls to list all parquet files in table location
+    2. Extract size from each FileInfo object
+    3. Calculate statistics from actual file sizes
+    4. Categorize files by size thresholds
+    5. Calculate percentage of small files
+    
+    Args:
+        table_path: Path to the Delta table (from DESCRIBE DETAIL location)
+        config: Analyzer configuration
+        
+    Returns:
+        Dictionary containing file layout statistics
+    """
+    result = {
+        "total_files": 0,
+        "total_size_bytes": 0,
+        "avg_file_size_bytes": 0,
+        "avg_file_size_mb": 0.0,
+        "median_file_size_mb": 0.0,
+        "min_file_size_mb": 0.0,
+        "max_file_size_mb": 0.0,
+        "std_dev_mb": 0.0,
+        "small_files_count": 0,
+        "small_files_pct": 0.0,
+        "severe_small_files_count": 0,
+        "severe_small_files_pct": 0.0,
+        "optimal_files_count": 0,
+        "optimal_files_pct": 0.0,
+        "file_sizes": [],
+        "file_details": [],
+        "error": None
+    }
+    
+    try:
+        # Get basic info from DESCRIBE DETAIL first
+        detail_df = spark.sql(f"DESCRIBE DETAIL delta.`{table_path}`")
+        detail_row = detail_df.first()
+        
+        num_files_from_detail = detail_row.numFiles if detail_row else 0
+        total_size_from_detail = detail_row.sizeInBytes if detail_row else 0
+        
+        if num_files_from_detail == 0:
+            return result
+        
+        # PRIMARY METHOD: Use dbutils.fs.ls to get actual file sizes
+        file_sizes, file_details = get_file_sizes_from_dbutils(table_path)
+        
+        # FALLBACK: If dbutils didn't work, try Delta log
+        if not file_sizes:
+            logger.info("Falling back to Delta log parsing for file sizes")
+            file_sizes = get_file_stats_from_delta_log(table_path)
+        
+        # Calculate statistics
+        if file_sizes:
+            total_size = sum(file_sizes)
+            num_files = len(file_sizes)
+            avg_size_bytes = total_size / num_files if num_files > 0 else 0
+            
+            file_sizes_mb = [bytes_to_mb(s) for s in file_sizes]
+            
+            result.update({
+                "total_files": num_files,
+                "total_size_bytes": total_size,
+                "avg_file_size_bytes": avg_size_bytes,
+                "avg_file_size_mb": round(statistics.mean(file_sizes_mb), 2) if file_sizes_mb else 0.0,
+                "median_file_size_mb": round(statistics.median(file_sizes_mb), 2) if file_sizes_mb else 0.0,
+                "min_file_size_mb": round(min(file_sizes_mb), 2) if file_sizes_mb else 0.0,
+                "max_file_size_mb": round(max(file_sizes_mb), 2) if file_sizes_mb else 0.0,
+                "std_dev_mb": round(statistics.stdev(file_sizes_mb), 2) if len(file_sizes_mb) > 1 else 0.0,
+                "file_sizes": file_sizes,
+                "file_details": file_details,
+            })
+            
+            # Categorize files by size thresholds
+            severe_threshold = config.small_file_severe_mb * 1024 * 1024  # bytes
+            acceptable_threshold = config.small_file_acceptable_mb * 1024 * 1024
+            optimal_min = config.optimal_file_size_min_mb * 1024 * 1024
+            optimal_max = config.optimal_file_size_max_mb * 1024 * 1024
+            
+            severe_count = sum(1 for s in file_sizes if s < severe_threshold)
+            small_count = sum(1 for s in file_sizes if s < acceptable_threshold)
+            optimal_count = sum(1 for s in file_sizes if optimal_min <= s <= optimal_max)
+            
+            result.update({
+                "severe_small_files_count": severe_count,
+                "severe_small_files_pct": round(100 * severe_count / num_files, 2),
+                "small_files_count": small_count,
+                "small_files_pct": round(100 * small_count / num_files, 2),
+                "optimal_files_count": optimal_count,
+                "optimal_files_pct": round(100 * optimal_count / num_files, 2),
+            })
+            
+            logger.info(f"Analyzed file layout: {num_files} files, avg size: {result['avg_file_size_mb']} MB, "
+                       f"median: {result['median_file_size_mb']} MB, "
+                       f"small files: {result['small_files_pct']}%")
+        else:
+            # If we couldn't get individual file sizes, use DESCRIBE DETAIL averages
+            avg_size_bytes = total_size_from_detail / num_files_from_detail if num_files_from_detail > 0 else 0
+            result.update({
+                "total_files": num_files_from_detail,
+                "total_size_bytes": total_size_from_detail,
+                "avg_file_size_bytes": avg_size_bytes,
+                "avg_file_size_mb": bytes_to_mb(avg_size_bytes),
+            })
+            logger.warning(f"Could not get individual file sizes, using averages from DESCRIBE DETAIL")
+        
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error(f"Error analyzing file layout for {table_path}: {e}")
+    
+    return result
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Partition Analysis
+# MAGIC ## 7. Partition Analysis
 
 # COMMAND ----------
 
@@ -566,6 +823,7 @@ def analyze_partitions(
         Dictionary containing partition analysis results
     """
     result = {
+        "is_partitioned": bool(partition_columns),
         "partition_count": 0,
         "partition_columns": partition_columns,
         "largest_partition_size_mb": 0.0,
@@ -573,6 +831,7 @@ def analyze_partitions(
         "median_partition_size_mb": 0.0,
         "avg_partition_size_mb": 0.0,
         "partition_skew_ratio": 0.0,
+        "partition_skew_severity": IssueSeverity.NONE.value,
         "has_partition_skew": False,
         "partition_distribution": [],
         "error": None
@@ -620,6 +879,7 @@ def analyze_partitions(
                     skew_ratio = result["largest_partition_size_mb"] / median
                     result["partition_skew_ratio"] = round(skew_ratio, 2)
                     result["has_partition_skew"] = skew_ratio > config.partition_skew_threshold
+                    result["partition_skew_severity"] = get_skew_severity(skew_ratio, config)
         
         logger.info(f"Analyzed partitions for {full_name}: {result['partition_count']} partitions")
         
@@ -699,7 +959,7 @@ def get_partition_sizes(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. File Size Skew Detection
+# MAGIC ## 8. File Size Skew Detection
 
 # COMMAND ----------
 
@@ -711,6 +971,14 @@ def detect_file_skew(file_sizes: List[int], config: AnalyzerConfig) -> Dict[str,
     File skew occurs when there's a large variance in file sizes,
     which can impact query performance.
     
+    Logic:
+    - Calculate skew_ratio = max_file_size / median_file_size
+    - Determine severity based on thresholds:
+      * ratio <= 3: NONE
+      * ratio <= 5: LOW
+      * ratio <= 10: MEDIUM  
+      * ratio > 10: HIGH
+    
     Args:
         file_sizes: List of file sizes in bytes
         config: Analyzer configuration
@@ -721,8 +989,9 @@ def detect_file_skew(file_sizes: List[int], config: AnalyzerConfig) -> Dict[str,
     result = {
         "file_skew_ratio": 0.0,
         "has_file_skew": False,
-        "skew_severity": "none",
+        "skew_severity": IssueSeverity.NONE.value,
         "coefficient_of_variation": 0.0,
+        "skew_description": "No significant skew",
         "error": None
     }
     
@@ -748,17 +1017,21 @@ def detect_file_skew(file_sizes: List[int], config: AnalyzerConfig) -> Dict[str,
         cv = (std_dev / mean_size * 100) if mean_size > 0 else 0
         result["coefficient_of_variation"] = round(cv, 2)
         
-        # Determine severity
-        if skew_ratio <= 3:
-            result["skew_severity"] = "none"
-        elif skew_ratio <= 5:
-            result["skew_severity"] = "low"
-        elif skew_ratio <= 10:
-            result["skew_severity"] = "medium"
-        else:
-            result["skew_severity"] = "high"
+        # Determine severity and description
+        severity = get_skew_severity(skew_ratio, config)
+        result["skew_severity"] = severity
         
-        logger.info(f"File skew analysis: ratio={skew_ratio:.2f}, severity={result['skew_severity']}")
+        # Generate description
+        if severity == IssueSeverity.NONE.value:
+            result["skew_description"] = "No significant skew - file sizes are well balanced"
+        elif severity == IssueSeverity.LOW.value:
+            result["skew_description"] = f"Minor skew detected (ratio: {skew_ratio:.1f}x) - monitor over time"
+        elif severity == IssueSeverity.MEDIUM.value:
+            result["skew_description"] = f"Moderate skew detected (ratio: {skew_ratio:.1f}x) - consider optimization"
+        else:
+            result["skew_description"] = f"Significant skew detected (ratio: {skew_ratio:.1f}x) - action required"
+        
+        logger.info(f"File skew analysis: ratio={skew_ratio:.2f}, severity={severity}")
         
     except Exception as e:
         result["error"] = str(e)
@@ -769,7 +1042,7 @@ def detect_file_skew(file_sizes: List[int], config: AnalyzerConfig) -> Dict[str,
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Delta History Analysis
+# MAGIC ## 9. Delta History Analysis
 
 # COMMAND ----------
 
@@ -784,6 +1057,11 @@ def analyze_delta_history(
     Analyze Delta table history to understand maintenance patterns.
     
     Uses DESCRIBE HISTORY to extract operation history without scanning data.
+    
+    Logic:
+    - Query DESCRIBE HISTORY for recent operations
+    - Track timestamps for OPTIMIZE, VACUUM, MERGE, WRITE, DELETE, UPDATE
+    - Calculate days since last maintenance operations
     
     Args:
         catalog: Catalog name
@@ -810,6 +1088,9 @@ def analyze_delta_history(
         "update_count": 0,
         "days_since_last_optimize": None,
         "days_since_last_vacuum": None,
+        "days_since_last_write": None,
+        "optimize_status": "Never run",
+        "vacuum_status": "Never run",
         "operation_summary": {},
         "history_df": None,
         "error": None
@@ -869,11 +1150,24 @@ def analyze_delta_history(
         
         # Calculate days since last operations
         now = datetime.now()
+        
+        if last_timestamps.get("WRITE"):
+            result["days_since_last_write"] = (now - last_timestamps["WRITE"]).days
+            
         if last_timestamps.get("OPTIMIZE"):
-            result["days_since_last_optimize"] = (now - last_timestamps["OPTIMIZE"]).days
+            days = (now - last_timestamps["OPTIMIZE"]).days
+            result["days_since_last_optimize"] = days
+            result["optimize_status"] = days_ago_str(days)
+        else:
+            result["optimize_status"] = "Never run"
+            
         if last_timestamps.get("VACUUM END") or last_timestamps.get("VACUUM START"):
             vacuum_ts = last_timestamps.get("VACUUM END") or last_timestamps.get("VACUUM START")
-            result["days_since_last_vacuum"] = (now - vacuum_ts).days
+            days = (now - vacuum_ts).days
+            result["days_since_last_vacuum"] = days
+            result["vacuum_status"] = days_ago_str(days)
+        else:
+            result["vacuum_status"] = "Never run"
         
         logger.info(f"Analyzed history for {full_name}: {result['total_commits']} commits")
         
@@ -886,7 +1180,7 @@ def analyze_delta_history(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. OPTIMIZE & ZORDER Detection
+# MAGIC ## 10. OPTIMIZE & ZORDER Detection
 
 # COMMAND ----------
 
@@ -1000,7 +1294,7 @@ def detect_optimize_operations(history_df: DataFrame) -> Dict[str, Any]:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 10. Table Growth Analysis
+# MAGIC ## 11. Table Growth Analysis
 
 # COMMAND ----------
 
@@ -1107,450 +1401,357 @@ def analyze_table_growth(history_df: DataFrame, table_size_bytes: int) -> Dict[s
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 11. Additional Health Checks
+# MAGIC ## 12. Issue Detection Engine
 
 # COMMAND ----------
 
-# DBTITLE 1,Health Check Functions
-@dataclass
-class HealthCheckResult:
-    """Result of a single health check."""
-    check_name: str
-    status: str  # "pass", "warn", "fail"
-    message: str
-    value: Any = None
-    threshold: Any = None
-    severity: str = "info"  # "info", "warning", "critical"
-
-
-def run_health_checks(
-    metadata: Dict[str, Any],
-    file_layout: Dict[str, Any],
-    partition_analysis: Dict[str, Any],
-    history_analysis: Dict[str, Any],
-    optimize_info: Dict[str, Any],
-    config: AnalyzerConfig
-) -> List[HealthCheckResult]:
-    """
-    Run comprehensive health checks on a Delta table.
-    
-    Args:
-        metadata: Table metadata
-        file_layout: File layout analysis results
-        partition_analysis: Partition analysis results
-        history_analysis: History analysis results
-        optimize_info: OPTIMIZE detection results
-        config: Analyzer configuration
-        
-    Returns:
-        List of HealthCheckResult objects
-    """
-    checks = []
-    
-    # 1. Small Files Check
-    avg_file_size_mb = file_layout.get("avg_file_size_mb", 0)
-    if avg_file_size_mb > 0:
-        if avg_file_size_mb < config.small_file_severe_mb:
-            checks.append(HealthCheckResult(
-                check_name="small_files",
-                status="fail",
-                message=f"Severe small files detected: avg size {avg_file_size_mb} MB < {config.small_file_severe_mb} MB threshold",
-                value=avg_file_size_mb,
-                threshold=config.small_file_severe_mb,
-                severity="critical"
-            ))
-        elif avg_file_size_mb < config.small_file_acceptable_mb:
-            checks.append(HealthCheckResult(
-                check_name="small_files",
-                status="warn",
-                message=f"Small files detected: avg size {avg_file_size_mb} MB < {config.small_file_acceptable_mb} MB threshold",
-                value=avg_file_size_mb,
-                threshold=config.small_file_acceptable_mb,
-                severity="warning"
-            ))
-        else:
-            checks.append(HealthCheckResult(
-                check_name="small_files",
-                status="pass",
-                message=f"File sizes acceptable: avg {avg_file_size_mb} MB",
-                value=avg_file_size_mb,
-                threshold=config.small_file_acceptable_mb,
-                severity="info"
-            ))
-    
-    # 2. Excess Partitions Check
-    partition_count = partition_analysis.get("partition_count", 0)
-    if partition_count > config.max_partition_count:
-        checks.append(HealthCheckResult(
-            check_name="excess_partitions",
-            status="fail",
-            message=f"Excess partitions: {partition_count} > {config.max_partition_count} threshold",
-            value=partition_count,
-            threshold=config.max_partition_count,
-            severity="critical"
-        ))
-    elif partition_count > config.max_partition_count * 0.8:
-        checks.append(HealthCheckResult(
-            check_name="excess_partitions",
-            status="warn",
-            message=f"Approaching partition limit: {partition_count} (threshold: {config.max_partition_count})",
-            value=partition_count,
-            threshold=config.max_partition_count,
-            severity="warning"
-        ))
-    elif partition_count > 0:
-        checks.append(HealthCheckResult(
-            check_name="partitions",
-            status="pass",
-            message=f"Partition count acceptable: {partition_count}",
-            value=partition_count,
-            threshold=config.max_partition_count,
-            severity="info"
-        ))
-    
-    # 3. Large Table Check
-    table_size_gb = metadata.get("table_size_gb", 0)
-    if table_size_gb > config.large_table_threshold_gb:
-        checks.append(HealthCheckResult(
-            check_name="large_table",
-            status="warn",
-            message=f"Large table: {table_size_gb} GB > {config.large_table_threshold_gb} GB",
-            value=table_size_gb,
-            threshold=config.large_table_threshold_gb,
-            severity="warning"
-        ))
-    
-    # 4. No Recent OPTIMIZE Check
-    days_since_optimize = history_analysis.get("days_since_last_optimize")
-    if days_since_optimize is None:
-        checks.append(HealthCheckResult(
-            check_name="no_optimize",
-            status="fail",
-            message="Table has never been optimized",
-            value=None,
-            threshold=config.optimize_stale_days,
-            severity="critical"
-        ))
-    elif days_since_optimize > config.optimize_stale_days:
-        checks.append(HealthCheckResult(
-            check_name="stale_optimize",
-            status="warn",
-            message=f"OPTIMIZE is stale: {days_since_optimize} days since last run (threshold: {config.optimize_stale_days})",
-            value=days_since_optimize,
-            threshold=config.optimize_stale_days,
-            severity="warning"
-        ))
-    else:
-        checks.append(HealthCheckResult(
-            check_name="optimize",
-            status="pass",
-            message=f"OPTIMIZE recent: {days_since_optimize} days ago",
-            value=days_since_optimize,
-            threshold=config.optimize_stale_days,
-            severity="info"
-        ))
-    
-    # 5. No Recent VACUUM Check
-    days_since_vacuum = history_analysis.get("days_since_last_vacuum")
-    if days_since_vacuum is None:
-        checks.append(HealthCheckResult(
-            check_name="no_vacuum",
-            status="warn",
-            message="Table has never been vacuumed",
-            value=None,
-            threshold=config.vacuum_stale_days,
-            severity="warning"
-        ))
-    elif days_since_vacuum > config.vacuum_stale_days:
-        checks.append(HealthCheckResult(
-            check_name="stale_vacuum",
-            status="warn",
-            message=f"VACUUM is stale: {days_since_vacuum} days since last run (threshold: {config.vacuum_stale_days})",
-            value=days_since_vacuum,
-            threshold=config.vacuum_stale_days,
-            severity="warning"
-        ))
-    else:
-        checks.append(HealthCheckResult(
-            check_name="vacuum",
-            status="pass",
-            message=f"VACUUM recent: {days_since_vacuum} days ago",
-            value=days_since_vacuum,
-            threshold=config.vacuum_stale_days,
-            severity="info"
-        ))
-    
-    # 6. File Skew Check
-    file_skew_ratio = file_layout.get("file_skew_ratio", 0) if "file_skew_ratio" in file_layout else 0
-    if file_skew_ratio > config.file_skew_threshold:
-        checks.append(HealthCheckResult(
-            check_name="file_skew",
-            status="warn",
-            message=f"File size skew detected: ratio {file_skew_ratio} > {config.file_skew_threshold}",
-            value=file_skew_ratio,
-            threshold=config.file_skew_threshold,
-            severity="warning"
-        ))
-    
-    # 7. Partition Skew Check
-    if partition_analysis.get("has_partition_skew"):
-        checks.append(HealthCheckResult(
-            check_name="partition_skew",
-            status="warn",
-            message=f"Partition skew detected: ratio {partition_analysis.get('partition_skew_ratio')}",
-            value=partition_analysis.get("partition_skew_ratio"),
-            threshold=config.partition_skew_threshold,
-            severity="warning"
-        ))
-    
-    # 8. Large Table Without ZORDER Check
-    if table_size_gb > config.zorder_recommend_threshold_gb:
-        zorder_cols = optimize_info.get("zorder_columns", [])
-        if not zorder_cols:
-            checks.append(HealthCheckResult(
-                check_name="no_zorder",
-                status="warn",
-                message=f"Large table ({table_size_gb} GB) without ZORDER optimization",
-                value=table_size_gb,
-                threshold=config.zorder_recommend_threshold_gb,
-                severity="warning"
-            ))
-    
-    return checks
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 12. Recommendation Engine
-
-# COMMAND ----------
-
-# DBTITLE 1,Recommendation Engine
-@dataclass
-class Recommendation:
-    """A single optimization recommendation."""
-    category: str
-    priority: str  # "critical", "high", "medium", "low"
-    title: str
-    description: str
-    sql_command: Optional[str] = None
-    impact: str = ""
-
-
-def generate_recommendations(
+# DBTITLE 1,Issue Detection Functions
+def detect_all_issues(
     full_table_name: str,
     metadata: Dict[str, Any],
     file_layout: Dict[str, Any],
-    partition_analysis: Dict[str, Any],
     file_skew: Dict[str, Any],
+    partition_analysis: Dict[str, Any],
     history_analysis: Dict[str, Any],
     optimize_info: Dict[str, Any],
-    health_checks: List[HealthCheckResult],
+    liquid_clustering: Dict[str, Any],
     config: AnalyzerConfig
-) -> List[Recommendation]:
+) -> List[TableIssue]:
     """
-    Generate optimization recommendations based on analysis results.
+    Detect all issues with a Delta table and create structured issue list.
     
-    This function evaluates all metrics and produces actionable recommendations
-    with SQL commands where applicable.
+    This function evaluates all metrics and produces a clear list of issues
+    with severity, details, and recommendations.
     
     Args:
         full_table_name: Fully qualified table name
         metadata: Table metadata
         file_layout: File layout analysis
-        partition_analysis: Partition analysis
         file_skew: File skew analysis
+        partition_analysis: Partition analysis
         history_analysis: History analysis
         optimize_info: OPTIMIZE detection results
-        health_checks: Health check results
+        liquid_clustering: Liquid clustering detection results
         config: Analyzer configuration
         
     Returns:
-        List of Recommendation objects
+        List of TableIssue objects
     """
-    recommendations = []
+    issues = []
     
     table_size_gb = metadata.get("table_size_gb", 0)
     avg_file_size_mb = file_layout.get("avg_file_size_mb", 0)
+    small_files_pct = file_layout.get("small_files_pct", 0)
+    severe_small_files_pct = file_layout.get("severe_small_files_pct", 0)
     partition_columns = metadata.get("partition_columns", [])
+    is_partitioned = bool(partition_columns)
     zorder_columns = optimize_info.get("zorder_columns", [])
+    is_liquid_clustered = liquid_clustering.get("is_liquid_clustered", False)
+    clustering_columns = liquid_clustering.get("clustering_columns", [])
     
-    # 1. Small Files Recommendation
-    if avg_file_size_mb < config.small_file_severe_mb and avg_file_size_mb > 0:
-        recommendations.append(Recommendation(
-            category="file_compaction",
-            priority="critical",
-            title="Run OPTIMIZE to compact small files",
-            description=f"Average file size ({avg_file_size_mb} MB) is below the severe threshold ({config.small_file_severe_mb} MB). "
-                       f"Small files significantly impact query performance.",
-            sql_command=f"OPTIMIZE {full_table_name};",
-            impact="Improved query performance, reduced storage overhead"
-        ))
-    elif avg_file_size_mb < config.small_file_acceptable_mb and avg_file_size_mb > 0:
-        recommendations.append(Recommendation(
-            category="file_compaction",
-            priority="high",
-            title="Consider running OPTIMIZE",
-            description=f"Average file size ({avg_file_size_mb} MB) is below acceptable threshold ({config.small_file_acceptable_mb} MB).",
-            sql_command=f"OPTIMIZE {full_table_name};",
-            impact="Better query performance"
-        ))
+    # =========================================================================
+    # ISSUE 1: Small Files Detection
+    # =========================================================================
+    # Logic: 
+    # - Critical if avg file size < 32MB OR >50% of files are small
+    # - Warning if avg file size < 128MB OR >20% of files are small
+    # =========================================================================
+    if metadata.get("num_files", 0) > 0 and avg_file_size_mb > 0:
+        if avg_file_size_mb < config.small_file_severe_mb or severe_small_files_pct > config.small_files_pct_critical:
+            severity = IssueSeverity.CRITICAL.value
+            issues.append(TableIssue(
+                issue_id="SMALL_FILES_CRITICAL",
+                category=IssueCategory.SMALL_FILES.value,
+                severity=severity,
+                title="Critical Small Files Issue",
+                details=f"Average file size: {avg_file_size_mb} MB (threshold: {config.small_file_severe_mb} MB). "
+                       f"Small files (<{config.small_file_severe_mb}MB): {severe_small_files_pct}% of total files. "
+                       f"Small files (<{config.small_file_acceptable_mb}MB): {small_files_pct}% of total files. "
+                       f"Total files: {metadata.get('num_files', 0):,}",
+                current_value=f"{avg_file_size_mb} MB avg, {severe_small_files_pct}% severe small files",
+                threshold=f">{config.small_file_severe_mb} MB avg, <{config.small_files_pct_critical}% small files",
+                recommendation="Run OPTIMIZE immediately to compact small files. Consider adjusting write batch sizes.",
+                sql_command=f"OPTIMIZE {full_table_name};"
+            ))
+        elif avg_file_size_mb < config.small_file_acceptable_mb or small_files_pct > config.small_files_pct_warning:
+            severity = IssueSeverity.MEDIUM.value
+            issues.append(TableIssue(
+                issue_id="SMALL_FILES_WARNING",
+                category=IssueCategory.SMALL_FILES.value,
+                severity=severity,
+                title="Small Files Issue",
+                details=f"Average file size: {avg_file_size_mb} MB (threshold: {config.small_file_acceptable_mb} MB). "
+                       f"Small files (<{config.small_file_acceptable_mb}MB): {small_files_pct}% of total files. "
+                       f"Total files: {metadata.get('num_files', 0):,}",
+                current_value=f"{avg_file_size_mb} MB avg, {small_files_pct}% small files",
+                threshold=f">{config.small_file_acceptable_mb} MB avg, <{config.small_files_pct_warning}% small files",
+                recommendation="Run OPTIMIZE to compact files. Schedule regular optimization jobs.",
+                sql_command=f"OPTIMIZE {full_table_name};"
+            ))
     
-    # 2. File Skew Recommendation
+    # =========================================================================
+    # ISSUE 2: File Skew Detection
+    # =========================================================================
+    # Logic:
+    # - skew_ratio = max_file_size / median_file_size
+    # - High: ratio > 10, Medium: ratio > 5, Low: ratio > 3
+    # =========================================================================
     file_skew_ratio = file_skew.get("file_skew_ratio", 0)
-    if file_skew_ratio > config.file_skew_threshold:
-        recommendations.append(Recommendation(
-            category="data_skew",
-            priority="high",
-            title="Investigate and fix file size skew",
-            description=f"File size skew ratio ({file_skew_ratio:.1f}x) exceeds threshold ({config.file_skew_threshold}x). "
-                       f"This may indicate uneven data distribution during writes.",
-            sql_command=None,
-            impact="More predictable query performance"
-        ))
-        recommendations.append(Recommendation(
-            category="data_skew",
-            priority="medium",
-            title="Consider repartitioning before writes",
-            description="Repartition data before writing to ensure even file sizes. "
-                       "Use df.repartition() or coalesce() to control output file count.",
-            sql_command=None,
-            impact="Reduced file size variance"
+    skew_severity = file_skew.get("skew_severity", IssueSeverity.NONE.value)
+    
+    if skew_severity != IssueSeverity.NONE.value:
+        issues.append(TableIssue(
+            issue_id=f"FILE_SKEW_{skew_severity.upper()}",
+            category=IssueCategory.FILE_SKEW.value,
+            severity=skew_severity,
+            title=f"File Size Skew ({skew_severity.capitalize()})",
+            details=f"File skew ratio: {file_skew_ratio}x (max/median). "
+                   f"Largest file: {file_layout.get('max_file_size_mb', 0)} MB, "
+                   f"Median file: {file_layout.get('median_file_size_mb', 0)} MB, "
+                   f"Smallest file: {file_layout.get('min_file_size_mb', 0)} MB. "
+                   f"Coefficient of variation: {file_skew.get('coefficient_of_variation', 0)}%",
+            current_value=f"{file_skew_ratio}x skew ratio",
+            threshold=f"<{config.skew_low_threshold}x (none), <{config.skew_high_threshold}x (acceptable)",
+            recommendation="Investigate data ingestion patterns. Repartition data before writing. Consider using coalesce() or repartition().",
+            sql_command=None
         ))
     
-    # 3. Large Table Without ZORDER Recommendation
-    if table_size_gb > config.zorder_recommend_threshold_gb and not zorder_columns:
-        # Try to suggest ZORDER columns based on common patterns
-        suggested_cols = suggest_zorder_columns(metadata, history_analysis)
-        
-        zorder_clause = ""
-        if suggested_cols:
-            zorder_clause = f" ZORDER BY ({', '.join(suggested_cols)})"
-            col_suggestion = f" Consider ZORDER BY ({', '.join(suggested_cols)}) based on common query patterns."
-        else:
-            col_suggestion = " Analyze query patterns to identify high-cardinality columns used in filters."
-        
-        recommendations.append(Recommendation(
-            category="zorder",
-            priority="high",
-            title="Implement ZORDER optimization",
-            description=f"Large table ({table_size_gb} GB) would benefit from ZORDER optimization.{col_suggestion}",
-            sql_command=f"OPTIMIZE {full_table_name}{zorder_clause};" if zorder_clause else None,
-            impact="Significantly improved query performance for filtered queries"
+    # =========================================================================
+    # ISSUE 3: Stale OPTIMIZE
+    # =========================================================================
+    # Logic:
+    # - Critical if OPTIMIZE never run
+    # - Warning if last OPTIMIZE > 30 days ago
+    # =========================================================================
+    days_since_optimize = history_analysis.get("days_since_last_optimize")
+    if days_since_optimize is None:
+        issues.append(TableIssue(
+            issue_id="OPTIMIZE_NEVER_RUN",
+            category=IssueCategory.STALE_OPTIMIZE.value,
+            severity=IssueSeverity.HIGH.value,
+            title="OPTIMIZE Never Run",
+            details="The table has never been optimized. OPTIMIZE compacts small files and improves query performance.",
+            current_value="Never",
+            threshold=f"Within last {config.optimize_stale_days} days",
+            recommendation="Run OPTIMIZE to compact files. Set up a scheduled job for regular optimization.",
+            sql_command=f"OPTIMIZE {full_table_name};" + (f" ZORDER BY ({', '.join(zorder_columns)});" if zorder_columns else "")
+        ))
+    elif days_since_optimize > config.optimize_stale_days:
+        issues.append(TableIssue(
+            issue_id="OPTIMIZE_STALE",
+            category=IssueCategory.STALE_OPTIMIZE.value,
+            severity=IssueSeverity.MEDIUM.value,
+            title="Stale OPTIMIZE",
+            details=f"Last OPTIMIZE was {days_since_optimize} days ago ({history_analysis.get('last_optimize_timestamp', 'Unknown')}). "
+                   f"Threshold: {config.optimize_stale_days} days.",
+            current_value=f"{days_since_optimize} days ago",
+            threshold=f"Within last {config.optimize_stale_days} days",
+            recommendation="Run OPTIMIZE to maintain query performance. Consider scheduling regular optimization.",
+            sql_command=f"OPTIMIZE {full_table_name};" + (f" ZORDER BY ({', '.join(zorder_columns)});" if zorder_columns else "")
         ))
     
-    # 4. Too Many Partitions Recommendation
+    # =========================================================================
+    # ISSUE 4: Stale VACUUM
+    # =========================================================================
+    # Logic:
+    # - Warning if VACUUM never run
+    # - Warning if last VACUUM > 30 days ago
+    # =========================================================================
+    days_since_vacuum = history_analysis.get("days_since_last_vacuum")
+    if days_since_vacuum is None:
+        issues.append(TableIssue(
+            issue_id="VACUUM_NEVER_RUN",
+            category=IssueCategory.STALE_VACUUM.value,
+            severity=IssueSeverity.MEDIUM.value,
+            title="VACUUM Never Run",
+            details="The table has never been vacuumed. VACUUM removes old files and reclaims storage space.",
+            current_value="Never",
+            threshold=f"Within last {config.vacuum_stale_days} days",
+            recommendation="Run VACUUM to remove old files and reclaim storage. Schedule regular vacuum jobs.",
+            sql_command=f"VACUUM {full_table_name} RETAIN 168 HOURS;"
+        ))
+    elif days_since_vacuum > config.vacuum_stale_days:
+        issues.append(TableIssue(
+            issue_id="VACUUM_STALE",
+            category=IssueCategory.STALE_VACUUM.value,
+            severity=IssueSeverity.LOW.value,
+            title="Stale VACUUM",
+            details=f"Last VACUUM was {days_since_vacuum} days ago ({history_analysis.get('last_vacuum_timestamp', 'Unknown')}). "
+                   f"Threshold: {config.vacuum_stale_days} days.",
+            current_value=f"{days_since_vacuum} days ago",
+            threshold=f"Within last {config.vacuum_stale_days} days",
+            recommendation="Run VACUUM to reclaim storage space and remove old files.",
+            sql_command=f"VACUUM {full_table_name} RETAIN 168 HOURS;"
+        ))
+    
+    # =========================================================================
+    # ISSUE 5: Large Table Without Partitioning (>1TB)
+    # =========================================================================
+    # Logic:
+    # - If table size > 1TB and not partitioned, recommend partitioning
+    # =========================================================================
+    if table_size_gb >= config.large_table_threshold_gb and not is_partitioned:
+        issues.append(TableIssue(
+            issue_id="LARGE_TABLE_NO_PARTITION",
+            category=IssueCategory.NO_PARTITIONING.value,
+            severity=IssueSeverity.HIGH.value,
+            title="Large Table Without Partitioning",
+            details=f"Table size: {table_size_gb} GB exceeds {config.large_table_threshold_gb} GB threshold. "
+                   f"Large tables should be partitioned for better query performance and maintenance.",
+            current_value=f"{table_size_gb} GB, not partitioned",
+            threshold=f"Tables >{config.large_table_threshold_gb} GB should be partitioned",
+            recommendation="Consider partitioning by a date column (e.g., created_date) or another high-cardinality column. "
+                          "Recreate the table with PARTITIONED BY clause.",
+            sql_command=f"-- Recreate with partitioning:\n-- CREATE TABLE {full_table_name}_new PARTITIONED BY (partition_column) AS SELECT * FROM {full_table_name};"
+        ))
+    
+    # =========================================================================
+    # ISSUE 6: Smaller Table Without Liquid Clustering (<1TB)
+    # =========================================================================
+    # Logic:
+    # - If table size < 1TB and not liquid clustered, recommend liquid clustering
+    # - Check DDL for CLUSTER BY clause
+    # =========================================================================
+    if table_size_gb < config.large_table_threshold_gb and table_size_gb > 10 and not is_liquid_clustered:
+        issues.append(TableIssue(
+            issue_id="NO_LIQUID_CLUSTERING",
+            category=IssueCategory.NO_LIQUID_CLUSTERING.value,
+            severity=IssueSeverity.MEDIUM.value,
+            title="No Liquid Clustering Configured",
+            details=f"Table size: {table_size_gb} GB. Table does not use Liquid Clustering. "
+                   f"Liquid Clustering provides automatic data layout optimization without manual OPTIMIZE ZORDER.",
+            current_value="Not enabled",
+            threshold="Recommended for tables >10GB and <1TB",
+            recommendation="Enable Liquid Clustering by altering the table with CLUSTER BY clause. "
+                          "Choose columns commonly used in query filters.",
+            sql_command=f"ALTER TABLE {full_table_name} CLUSTER BY (column1, column2);"
+        ))
+    
+    # =========================================================================
+    # ISSUE 7: Large Table Without ZORDER
+    # =========================================================================
+    # Logic:
+    # - If table > 500GB and no ZORDER columns detected in history
+    # =========================================================================
+    if table_size_gb > config.zorder_recommend_threshold_gb and not zorder_columns and not is_liquid_clustered:
+        issues.append(TableIssue(
+            issue_id="NO_ZORDER",
+            category=IssueCategory.NO_ZORDER.value,
+            severity=IssueSeverity.MEDIUM.value,
+            title="Large Table Without ZORDER",
+            details=f"Table size: {table_size_gb} GB. No ZORDER optimization detected in table history. "
+                   f"ZORDER colocates related data for faster filtered queries.",
+            current_value="No ZORDER columns",
+            threshold=f"Recommended for tables >{config.zorder_recommend_threshold_gb} GB",
+            recommendation="Run OPTIMIZE with ZORDER BY clause on columns commonly used in query filters. "
+                          "Or consider migrating to Liquid Clustering.",
+            sql_command=f"OPTIMIZE {full_table_name} ZORDER BY (column1, column2);"
+        ))
+    
+    # =========================================================================
+    # ISSUE 8: Excess Partitions
+    # =========================================================================
+    # Logic:
+    # - Critical if partition count > 5000
+    # - Warning if partition count > 4000 (80% of limit)
+    # =========================================================================
     partition_count = partition_analysis.get("partition_count", 0)
     if partition_count > config.max_partition_count:
-        recommendations.append(Recommendation(
-            category="partitioning",
-            priority="critical",
-            title="Re-evaluate partition strategy",
-            description=f"Table has {partition_count} partitions, exceeding the recommended maximum ({config.max_partition_count}). "
-                       f"This can cause performance issues and metadata overhead.",
-            sql_command=None,
-            impact="Reduced metadata overhead, improved query planning"
+        issues.append(TableIssue(
+            issue_id="EXCESS_PARTITIONS",
+            category=IssueCategory.EXCESS_PARTITIONS.value,
+            severity=IssueSeverity.CRITICAL.value,
+            title="Excessive Partition Count",
+            details=f"Partition count: {partition_count:,} exceeds maximum recommended ({config.max_partition_count:,}). "
+                   f"Partition columns: {', '.join(partition_columns)}. "
+                   f"Excessive partitions cause metadata overhead and slow query planning.",
+            current_value=f"{partition_count:,} partitions",
+            threshold=f"<{config.max_partition_count:,} partitions",
+            recommendation="Re-evaluate partitioning strategy. Consider coarser granularity (month instead of day) "
+                          "or fewer partition columns.",
+            sql_command=None
         ))
-        recommendations.append(Recommendation(
-            category="partitioning",
-            priority="high",
-            title="Consider coarser partition granularity",
-            description="If partitioning by date, consider using month or year instead of day. "
-                       "For other columns, consider using partition transforms or fewer values.",
-            sql_command=None,
-            impact="Fewer partitions to manage"
-        ))
-    
-    # 5. Stale OPTIMIZE Recommendation
-    days_since_optimize = history_analysis.get("days_since_last_optimize")
-    if days_since_optimize is None or days_since_optimize > config.optimize_stale_days:
-        days_str = "never" if days_since_optimize is None else f"{days_since_optimize} days ago"
-        
-        optimize_cmd = f"OPTIMIZE {full_table_name}"
-        if zorder_columns:
-            optimize_cmd += f" ZORDER BY ({', '.join(zorder_columns)})"
-        optimize_cmd += ";"
-        
-        recommendations.append(Recommendation(
-            category="maintenance",
-            priority="high" if days_since_optimize is None else "medium",
-            title="Schedule regular OPTIMIZE jobs",
-            description=f"Last OPTIMIZE was {days_str}. Regular optimization maintains query performance.",
-            sql_command=optimize_cmd,
-            impact="Maintained query performance over time"
+    elif partition_count > config.max_partition_count * 0.8:
+        issues.append(TableIssue(
+            issue_id="HIGH_PARTITION_COUNT",
+            category=IssueCategory.EXCESS_PARTITIONS.value,
+            severity=IssueSeverity.MEDIUM.value,
+            title="High Partition Count",
+            details=f"Partition count: {partition_count:,} is approaching maximum ({config.max_partition_count:,}). "
+                   f"Partition columns: {', '.join(partition_columns)}.",
+            current_value=f"{partition_count:,} partitions",
+            threshold=f"<{config.max_partition_count:,} partitions",
+            recommendation="Monitor partition growth. Plan for re-partitioning if growth continues.",
+            sql_command=None
         ))
     
-    # 6. Stale VACUUM Recommendation
-    days_since_vacuum = history_analysis.get("days_since_last_vacuum")
-    if days_since_vacuum is None or days_since_vacuum > config.vacuum_stale_days:
-        days_str = "never" if days_since_vacuum is None else f"{days_since_vacuum} days ago"
-        recommendations.append(Recommendation(
-            category="maintenance",
-            priority="medium",
-            title="Run VACUUM to reclaim storage",
-            description=f"Last VACUUM was {days_str}. VACUUM removes old files and reclaims storage.",
-            sql_command=f"VACUUM {full_table_name} RETAIN 168 HOURS;",
-            impact="Reduced storage costs, cleaned up old files"
-        ))
-    
-    # 7. Partition Skew Recommendation
+    # =========================================================================
+    # ISSUE 9: Partition Skew
+    # =========================================================================
+    # Logic:
+    # - Same severity logic as file skew
+    # =========================================================================
     if partition_analysis.get("has_partition_skew"):
-        recommendations.append(Recommendation(
-            category="data_skew",
-            priority="medium",
-            title="Address partition skew",
-            description=f"Partition skew detected (ratio: {partition_analysis.get('partition_skew_ratio'):.1f}). "
-                       f"Some partitions are significantly larger than others.",
-            sql_command=None,
-            impact="More balanced query performance across partitions"
+        partition_skew_ratio = partition_analysis.get("partition_skew_ratio", 0)
+        partition_skew_severity = partition_analysis.get("partition_skew_severity", IssueSeverity.MEDIUM.value)
+        issues.append(TableIssue(
+            issue_id=f"PARTITION_SKEW_{partition_skew_severity.upper()}",
+            category=IssueCategory.PARTITION_SKEW.value,
+            severity=partition_skew_severity,
+            title=f"Partition Size Skew ({partition_skew_severity.capitalize()})",
+            details=f"Partition skew ratio: {partition_skew_ratio}x (largest/median). "
+                   f"Largest partition: {partition_analysis.get('largest_partition_size_mb', 0)} MB, "
+                   f"Median partition: {partition_analysis.get('median_partition_size_mb', 0)} MB, "
+                   f"Smallest partition: {partition_analysis.get('smallest_partition_size_mb', 0)} MB.",
+            current_value=f"{partition_skew_ratio}x skew ratio",
+            threshold=f"<{config.partition_skew_threshold}x",
+            recommendation="Investigate partition key distribution. Consider using a different partition column "
+                          "or transforming the partition key for more even distribution.",
+            sql_command=None
         ))
     
-    # Sort recommendations by priority
-    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    recommendations.sort(key=lambda r: priority_order.get(r.priority, 4))
+    # Sort issues by severity
+    severity_order = {
+        IssueSeverity.CRITICAL.value: 0,
+        IssueSeverity.HIGH.value: 1,
+        IssueSeverity.MEDIUM.value: 2,
+        IssueSeverity.LOW.value: 3,
+        IssueSeverity.NONE.value: 4
+    }
+    issues.sort(key=lambda i: severity_order.get(i.severity, 5))
     
-    return recommendations
+    return issues
 
 
-def suggest_zorder_columns(metadata: Dict[str, Any], history_analysis: Dict[str, Any]) -> List[str]:
+def compute_health_status(issues: List[TableIssue]) -> str:
     """
-    Suggest ZORDER columns based on table patterns.
+    Compute overall health status based on detected issues.
     
-    This is a heuristic-based suggestion. For best results, analyze actual query patterns.
+    Logic:
+    - CRITICAL: Any critical severity issue
+    - WARNING: Any high severity issue
+    - NEEDS_ATTENTION: Any medium severity issue
+    - HEALTHY: Only low/no severity issues or no issues
     
     Args:
-        metadata: Table metadata
-        history_analysis: History analysis results
+        issues: List of detected issues
         
     Returns:
-        List of suggested column names
+        Health status string
     """
-    suggestions = []
+    if not issues:
+        return HealthStatus.HEALTHY.value
     
-    # Common ZORDER-worthy column patterns
-    common_patterns = [
-        "customer_id", "user_id", "account_id", "tenant_id",
-        "transaction_id", "order_id", "event_id",
-        "created_at", "updated_at", "event_time", "timestamp",
-        "region", "country", "state"
-    ]
+    severities = [i.severity for i in issues]
     
-    # This would ideally analyze table schema, but we keep it simple here
-    # In production, you could query DESCRIBE TABLE to get column names
-    
-    return suggestions
-
-
-def format_recommendations_summary(recommendations: List[Recommendation]) -> str:
-    """Format recommendations as a readable summary."""
-    if not recommendations:
-        return "No recommendations - table is well optimized!"
-    
-    summary_parts = []
-    for rec in recommendations:
-        summary_parts.append(f"[{rec.priority.upper()}] {rec.title}")
-    
-    return " | ".join(summary_parts)
+    if IssueSeverity.CRITICAL.value in severities:
+        return HealthStatus.CRITICAL.value
+    elif IssueSeverity.HIGH.value in severities:
+        return HealthStatus.WARNING.value
+    elif IssueSeverity.MEDIUM.value in severities:
+        return HealthStatus.NEEDS_ATTENTION.value
+    else:
+        return HealthStatus.HEALTHY.value
 
 # COMMAND ----------
 
@@ -1563,23 +1764,59 @@ def format_recommendations_summary(recommendations: List[Recommendation]) -> str
 @dataclass
 class TableAnalysisResult:
     """Complete analysis result for a single table."""
+    # Basic info
     catalog: str
     schema: str
     table: str
     full_name: str
+    
+    # Size metrics
     table_size_gb: float
     num_files: int
     avg_file_size_mb: float
+    
+    # Small files metrics
+    small_files_pct: float
+    severe_small_files_pct: float
+    
+    # Skew metrics
+    file_skew_ratio: float
+    file_skew_severity: str
+    
+    # Partition info
+    is_partitioned: bool
     partition_count: int
     partition_columns: List[str]
-    skew_ratio: float
-    last_optimize: Optional[str]
-    last_vacuum: Optional[str]
+    partition_skew_ratio: float
+    partition_skew_severity: str
+    
+    # Clustering info
+    is_liquid_clustered: bool
+    clustering_columns: List[str]
     zorder_columns: List[str]
-    recommendations: List[str]
-    recommendations_detail: List[Recommendation]
-    health_checks: List[HealthCheckResult]
+    
+    # Maintenance status
+    last_optimize: Optional[str]
+    last_optimize_days_ago: Optional[int]
+    optimize_status: str
+    last_vacuum: Optional[str]
+    last_vacuum_days_ago: Optional[int]
+    vacuum_status: str
+    
+    # Health status
+    health_status: str
+    issue_count: int
+    critical_issues: int
+    high_issues: int
+    medium_issues: int
+    low_issues: int
+    
+    # Detailed results
+    issues: List[TableIssue]
+    sql_commands: List[str]
     analysis_timestamp: str
+    
+    # Raw data (for detailed analysis)
     metadata: Dict[str, Any]
     file_layout: Dict[str, Any]
     partition_analysis: Dict[str, Any]
@@ -1587,7 +1824,8 @@ class TableAnalysisResult:
     optimize_info: Dict[str, Any]
     growth_analysis: Dict[str, Any]
     file_skew: Dict[str, Any]
-    sql_commands: List[str]
+    liquid_clustering: Dict[str, Any]
+    
     error: Optional[str] = None
 
 
@@ -1617,8 +1855,8 @@ def analyze_table(
     
     logger.info(f"Starting analysis of {full_name}")
     
-    # Initialize result with defaults
-    result = TableAnalysisResult(
+    # Initialize with defaults
+    default_result = TableAnalysisResult(
         catalog=catalog,
         schema=schema,
         table=table,
@@ -1626,15 +1864,32 @@ def analyze_table(
         table_size_gb=0.0,
         num_files=0,
         avg_file_size_mb=0.0,
+        small_files_pct=0.0,
+        severe_small_files_pct=0.0,
+        file_skew_ratio=0.0,
+        file_skew_severity=IssueSeverity.NONE.value,
+        is_partitioned=False,
         partition_count=0,
         partition_columns=[],
-        skew_ratio=0.0,
-        last_optimize=None,
-        last_vacuum=None,
+        partition_skew_ratio=0.0,
+        partition_skew_severity=IssueSeverity.NONE.value,
+        is_liquid_clustered=False,
+        clustering_columns=[],
         zorder_columns=[],
-        recommendations=[],
-        recommendations_detail=[],
-        health_checks=[],
+        last_optimize=None,
+        last_optimize_days_ago=None,
+        optimize_status="Never",
+        last_vacuum=None,
+        last_vacuum_days_ago=None,
+        vacuum_status="Never",
+        health_status=HealthStatus.ERROR.value,
+        issue_count=0,
+        critical_issues=0,
+        high_issues=0,
+        medium_issues=0,
+        low_issues=0,
+        issues=[],
+        sql_commands=[],
         analysis_timestamp=analysis_timestamp,
         metadata={},
         file_layout={},
@@ -1643,94 +1898,115 @@ def analyze_table(
         optimize_info={},
         growth_analysis={},
         file_skew={},
-        sql_commands=[]
+        liquid_clustering={}
     )
     
     try:
         # Step 1: Collect metadata
-        logger.info(f"[1/7] Collecting metadata for {full_name}")
+        logger.info(f"[1/8] Collecting metadata for {full_name}")
         metadata = collect_table_metadata(catalog, schema, table)
-        result.metadata = metadata
+        default_result.metadata = metadata
         
         if not metadata.get("is_valid"):
-            result.error = metadata.get("error", "Invalid table or not a Delta table")
-            logger.warning(f"Table {full_name} is not valid: {result.error}")
-            return result
+            default_result.error = metadata.get("error", "Invalid table or not a Delta table")
+            logger.warning(f"Table {full_name} is not valid: {default_result.error}")
+            return default_result
         
-        result.table_size_gb = metadata.get("table_size_gb", 0)
-        result.num_files = metadata.get("num_files", 0)
-        result.partition_columns = metadata.get("partition_columns", [])
+        default_result.table_size_gb = metadata.get("table_size_gb", 0)
+        default_result.num_files = metadata.get("num_files", 0)
+        default_result.partition_columns = metadata.get("partition_columns", [])
+        default_result.is_partitioned = bool(default_result.partition_columns)
         
-        # Step 2: Analyze file layout
-        logger.info(f"[2/7] Analyzing file layout for {full_name}")
+        # Step 2: Detect Liquid Clustering
+        logger.info(f"[2/8] Checking Liquid Clustering for {full_name}")
+        liquid_clustering = detect_liquid_clustering(catalog, schema, table)
+        default_result.liquid_clustering = liquid_clustering
+        default_result.is_liquid_clustered = liquid_clustering.get("is_liquid_clustered", False)
+        default_result.clustering_columns = liquid_clustering.get("clustering_columns", [])
+        
+        # Step 3: Analyze file layout
+        logger.info(f"[3/8] Analyzing file layout for {full_name}")
         table_path = metadata.get("location")
+        file_layout = {}
+        file_skew = {}
+        
         if table_path:
             file_layout = analyze_file_layout(table_path, config)
-            result.file_layout = file_layout
-            result.avg_file_size_mb = file_layout.get("avg_file_size_mb", 0)
+            default_result.file_layout = file_layout
+            default_result.avg_file_size_mb = file_layout.get("avg_file_size_mb", 0)
+            default_result.small_files_pct = file_layout.get("small_files_pct", 0)
+            default_result.severe_small_files_pct = file_layout.get("severe_small_files_pct", 0)
             
             # Detect file skew
             if file_layout.get("file_sizes"):
                 file_skew = detect_file_skew(file_layout["file_sizes"], config)
-                result.file_skew = file_skew
-                result.skew_ratio = file_skew.get("file_skew_ratio", 0)
+                default_result.file_skew = file_skew
+                default_result.file_skew_ratio = file_skew.get("file_skew_ratio", 0)
+                default_result.file_skew_severity = file_skew.get("skew_severity", IssueSeverity.NONE.value)
         
-        # Step 3: Analyze partitions
-        logger.info(f"[3/7] Analyzing partitions for {full_name}")
+        # Step 4: Analyze partitions
+        logger.info(f"[4/8] Analyzing partitions for {full_name}")
         partition_analysis = analyze_partitions(
             catalog, schema, table, 
-            result.partition_columns, config
+            default_result.partition_columns, config
         )
-        result.partition_analysis = partition_analysis
-        result.partition_count = partition_analysis.get("partition_count", 0)
+        default_result.partition_analysis = partition_analysis
+        default_result.partition_count = partition_analysis.get("partition_count", 0)
+        default_result.partition_skew_ratio = partition_analysis.get("partition_skew_ratio", 0)
+        default_result.partition_skew_severity = partition_analysis.get("partition_skew_severity", IssueSeverity.NONE.value)
         
-        # Step 4: Analyze Delta history
-        logger.info(f"[4/7] Analyzing Delta history for {full_name}")
+        # Step 5: Analyze Delta history
+        logger.info(f"[5/8] Analyzing Delta history for {full_name}")
         history_analysis = analyze_delta_history(catalog, schema, table, config)
-        result.history_analysis = history_analysis
-        result.last_optimize = history_analysis.get("last_optimize_timestamp")
-        result.last_vacuum = history_analysis.get("last_vacuum_timestamp")
+        default_result.history_analysis = history_analysis
+        default_result.last_optimize = history_analysis.get("last_optimize_timestamp")
+        default_result.last_optimize_days_ago = history_analysis.get("days_since_last_optimize")
+        default_result.optimize_status = history_analysis.get("optimize_status", "Never")
+        default_result.last_vacuum = history_analysis.get("last_vacuum_timestamp")
+        default_result.last_vacuum_days_ago = history_analysis.get("days_since_last_vacuum")
+        default_result.vacuum_status = history_analysis.get("vacuum_status", "Never")
         
-        # Step 5: Detect OPTIMIZE operations
-        logger.info(f"[5/7] Detecting OPTIMIZE operations for {full_name}")
+        # Step 6: Detect OPTIMIZE operations
+        logger.info(f"[6/8] Detecting OPTIMIZE operations for {full_name}")
         optimize_info = detect_optimize_operations(history_analysis.get("history_df"))
-        result.optimize_info = optimize_info
-        result.zorder_columns = optimize_info.get("zorder_columns", [])
+        default_result.optimize_info = optimize_info
+        default_result.zorder_columns = optimize_info.get("zorder_columns", [])
         
-        # Step 6: Analyze growth
-        logger.info(f"[6/7] Analyzing growth for {full_name}")
+        # Step 7: Analyze growth
+        logger.info(f"[7/8] Analyzing growth for {full_name}")
         growth_analysis = analyze_table_growth(
             history_analysis.get("history_df"),
             metadata.get("table_size_bytes", 0)
         )
-        result.growth_analysis = growth_analysis
+        default_result.growth_analysis = growth_analysis
         
-        # Step 7: Run health checks and generate recommendations
-        logger.info(f"[7/7] Running health checks for {full_name}")
-        health_checks = run_health_checks(
-            metadata, result.file_layout, partition_analysis,
-            history_analysis, optimize_info, config
+        # Step 8: Detect all issues
+        logger.info(f"[8/8] Detecting issues for {full_name}")
+        issues = detect_all_issues(
+            full_name, metadata, file_layout, file_skew,
+            partition_analysis, history_analysis, optimize_info,
+            liquid_clustering, config
         )
-        result.health_checks = health_checks
+        default_result.issues = issues
+        default_result.issue_count = len(issues)
+        default_result.critical_issues = sum(1 for i in issues if i.severity == IssueSeverity.CRITICAL.value)
+        default_result.high_issues = sum(1 for i in issues if i.severity == IssueSeverity.HIGH.value)
+        default_result.medium_issues = sum(1 for i in issues if i.severity == IssueSeverity.MEDIUM.value)
+        default_result.low_issues = sum(1 for i in issues if i.severity == IssueSeverity.LOW.value)
         
-        # Generate recommendations
-        recommendations = generate_recommendations(
-            full_name, metadata, result.file_layout, partition_analysis,
-            result.file_skew, history_analysis, optimize_info, health_checks, config
-        )
-        result.recommendations_detail = recommendations
-        result.recommendations = [r.title for r in recommendations]
+        # Compute health status
+        default_result.health_status = compute_health_status(issues)
         
         # Collect SQL commands
-        result.sql_commands = [r.sql_command for r in recommendations if r.sql_command]
+        default_result.sql_commands = [i.sql_command for i in issues if i.sql_command]
         
-        logger.info(f"Analysis complete for {full_name}: {len(recommendations)} recommendations")
+        logger.info(f"Analysis complete for {full_name}: {len(issues)} issues, status: {default_result.health_status}")
         
     except Exception as e:
-        result.error = str(e)
+        default_result.error = str(e)
         logger.error(f"Error analyzing {full_name}: {e}")
     
-    return result
+    return default_result
 
 # COMMAND ----------
 
@@ -1742,7 +2018,7 @@ def analyze_table(
 # DBTITLE 1,Report Generation Functions
 def create_report_dataframe(results: List[TableAnalysisResult]) -> DataFrame:
     """
-    Create a Spark DataFrame from analysis results.
+    Create a Spark DataFrame from analysis results with clear issue columns.
     
     Args:
         results: List of TableAnalysisResult objects
@@ -1750,22 +2026,55 @@ def create_report_dataframe(results: List[TableAnalysisResult]) -> DataFrame:
     Returns:
         Spark DataFrame with analysis results
     """
-    # Define schema
+    # Define schema with clear columns
     schema = StructType([
         StructField("catalog", StringType(), True),
         StructField("schema", StringType(), True),
         StructField("table", StringType(), True),
         StructField("table_size_gb", DoubleType(), True),
         StructField("num_files", LongType(), True),
+        
+        # Small Files columns
         StructField("avg_file_size_mb", DoubleType(), True),
+        StructField("small_files_pct", DoubleType(), True),
+        StructField("severe_small_files_pct", DoubleType(), True),
+        
+        # Skew columns
+        StructField("file_skew_ratio", DoubleType(), True),
+        StructField("file_skew_severity", StringType(), True),
+        
+        # Partition columns
+        StructField("is_partitioned", BooleanType(), True),
         StructField("partition_count", IntegerType(), True),
-        StructField("skew_ratio", DoubleType(), True),
-        StructField("last_optimize", StringType(), True),
-        StructField("last_vacuum", StringType(), True),
+        StructField("partition_columns", StringType(), True),
+        StructField("partition_skew_ratio", DoubleType(), True),
+        
+        # Clustering columns
+        StructField("is_liquid_clustered", BooleanType(), True),
+        StructField("clustering_columns", StringType(), True),
         StructField("zorder_columns", StringType(), True),
-        StructField("recommendations", StringType(), True),
-        StructField("sql_commands", StringType(), True),
+        
+        # Maintenance columns
+        StructField("last_optimize", StringType(), True),
+        StructField("last_optimize_days_ago", IntegerType(), True),
+        StructField("optimize_status", StringType(), True),
+        StructField("last_vacuum", StringType(), True),
+        StructField("last_vacuum_days_ago", IntegerType(), True),
+        StructField("vacuum_status", StringType(), True),
+        
+        # Health status columns
         StructField("health_status", StringType(), True),
+        StructField("issue_count", IntegerType(), True),
+        StructField("critical_issues", IntegerType(), True),
+        StructField("high_issues", IntegerType(), True),
+        StructField("medium_issues", IntegerType(), True),
+        StructField("low_issues", IntegerType(), True),
+        
+        # Issue details
+        StructField("issues_summary", StringType(), True),
+        StructField("sql_commands", StringType(), True),
+        
+        # Metadata
         StructField("analysis_timestamp", StringType(), True),
         StructField("error", StringType(), True)
     ])
@@ -1773,16 +2082,16 @@ def create_report_dataframe(results: List[TableAnalysisResult]) -> DataFrame:
     # Convert results to rows
     rows = []
     for r in results:
-        # Determine health status
-        health_status = "healthy"
-        if r.health_checks:
-            if any(c.status == "fail" for c in r.health_checks):
-                health_status = "critical"
-            elif any(c.status == "warn" for c in r.health_checks):
-                health_status = "warning"
-        
-        if r.error:
-            health_status = "error"
+        # Create issues summary
+        issues_summary = []
+        for issue in r.issues:
+            issues_summary.append({
+                "id": issue.issue_id,
+                "category": issue.category,
+                "severity": issue.severity,
+                "title": issue.title,
+                "details": issue.details
+            })
         
         rows.append((
             r.catalog,
@@ -1790,18 +2099,102 @@ def create_report_dataframe(results: List[TableAnalysisResult]) -> DataFrame:
             r.table,
             float(r.table_size_gb),
             int(r.num_files),
+            
+            # Small files
             float(r.avg_file_size_mb),
+            float(r.small_files_pct),
+            float(r.severe_small_files_pct),
+            
+            # Skew
+            float(r.file_skew_ratio),
+            r.file_skew_severity,
+            
+            # Partitions
+            r.is_partitioned,
             int(r.partition_count),
-            float(r.skew_ratio),
-            r.last_optimize,
-            r.last_vacuum,
+            json.dumps(r.partition_columns) if r.partition_columns else "[]",
+            float(r.partition_skew_ratio),
+            
+            # Clustering
+            r.is_liquid_clustered,
+            json.dumps(r.clustering_columns) if r.clustering_columns else "[]",
             json.dumps(r.zorder_columns) if r.zorder_columns else "[]",
-            json.dumps(r.recommendations) if r.recommendations else "[]",
+            
+            # Maintenance
+            r.last_optimize,
+            r.last_optimize_days_ago,
+            r.optimize_status,
+            r.last_vacuum,
+            r.last_vacuum_days_ago,
+            r.vacuum_status,
+            
+            # Health
+            r.health_status,
+            r.issue_count,
+            r.critical_issues,
+            r.high_issues,
+            r.medium_issues,
+            r.low_issues,
+            
+            # Details
+            json.dumps(issues_summary) if issues_summary else "[]",
             json.dumps(r.sql_commands) if r.sql_commands else "[]",
-            health_status,
+            
+            # Metadata
             r.analysis_timestamp,
             r.error
         ))
+    
+    return spark.createDataFrame(rows, schema)
+
+
+def create_issues_dataframe(results: List[TableAnalysisResult]) -> DataFrame:
+    """
+    Create a DataFrame with one row per issue for detailed analysis.
+    
+    Args:
+        results: List of TableAnalysisResult objects
+        
+    Returns:
+        Spark DataFrame with issues
+    """
+    schema = StructType([
+        StructField("catalog", StringType(), True),
+        StructField("schema", StringType(), True),
+        StructField("table", StringType(), True),
+        StructField("issue_id", StringType(), True),
+        StructField("category", StringType(), True),
+        StructField("severity", StringType(), True),
+        StructField("title", StringType(), True),
+        StructField("details", StringType(), True),
+        StructField("current_value", StringType(), True),
+        StructField("threshold", StringType(), True),
+        StructField("recommendation", StringType(), True),
+        StructField("sql_command", StringType(), True),
+        StructField("analysis_timestamp", StringType(), True)
+    ])
+    
+    rows = []
+    for r in results:
+        for issue in r.issues:
+            rows.append((
+                r.catalog,
+                r.schema,
+                r.table,
+                issue.issue_id,
+                issue.category,
+                issue.severity,
+                issue.title,
+                issue.details,
+                issue.current_value,
+                issue.threshold,
+                issue.recommendation,
+                issue.sql_command,
+                r.analysis_timestamp
+            ))
+    
+    if not rows:
+        return spark.createDataFrame([], schema)
     
     return spark.createDataFrame(rows, schema)
 
@@ -1818,70 +2211,101 @@ def display_summary_report(results: List[TableAnalysisResult]) -> None:
     print("=" * 80)
     print(f"Analysis Timestamp: {datetime.now().isoformat()}")
     print(f"Tables Analyzed: {len(results)}")
+    
+    # Summary counts
+    healthy = sum(1 for r in results if r.health_status == HealthStatus.HEALTHY.value)
+    needs_attention = sum(1 for r in results if r.health_status == HealthStatus.NEEDS_ATTENTION.value)
+    warning = sum(1 for r in results if r.health_status == HealthStatus.WARNING.value)
+    critical = sum(1 for r in results if r.health_status == HealthStatus.CRITICAL.value)
+    
+    print(f"\nHealth Summary:")
+    print(f"  ✅ Healthy:         {healthy}")
+    print(f"  ⚠️  Needs Attention: {needs_attention}")
+    print(f"  🟠 Warning:         {warning}")
+    print(f"  🔴 Critical:        {critical}")
     print("=" * 80 + "\n")
     
     for r in results:
-        print(f"\n{'─' * 60}")
-        print(f"📊 TABLE: {r.full_name}")
-        print(f"{'─' * 60}")
+        print(f"\n{'─' * 70}")
+        
+        # Health status indicator
+        status_icons = {
+            HealthStatus.HEALTHY.value: "✅",
+            HealthStatus.NEEDS_ATTENTION.value: "⚠️",
+            HealthStatus.WARNING.value: "🟠",
+            HealthStatus.CRITICAL.value: "🔴",
+            HealthStatus.ERROR.value: "❌"
+        }
+        status_icon = status_icons.get(r.health_status, "❓")
+        
+        print(f"{status_icon} TABLE: {r.full_name}")
+        print(f"   Health Status: {r.health_status.upper()}")
+        print(f"{'─' * 70}")
         
         if r.error:
             print(f"❌ Error: {r.error}")
             continue
         
-        # Basic metrics
+        # Storage metrics
         print(f"\n📁 STORAGE METRICS:")
-        print(f"   • Table Size:         {r.table_size_gb:.2f} GB")
-        print(f"   • Number of Files:    {r.num_files:,}")
-        print(f"   • Avg File Size:      {r.avg_file_size_mb:.2f} MB")
-        print(f"   • Partitions:         {r.partition_count:,}")
-        if r.partition_columns:
-            print(f"   • Partition Columns:  {', '.join(r.partition_columns)}")
+        print(f"   • Table Size:           {r.table_size_gb:.2f} GB")
+        print(f"   • Number of Files:      {r.num_files:,}")
+        print(f"   • Avg File Size:        {r.avg_file_size_mb:.2f} MB")
+        print(f"   • Small Files (<128MB): {r.small_files_pct:.1f}%")
+        print(f"   • Severe Small (<32MB): {r.severe_small_files_pct:.1f}%")
         
         # Skew info
-        if r.skew_ratio > 1:
-            print(f"\n⚖️  SKEW ANALYSIS:")
-            print(f"   • File Skew Ratio:    {r.skew_ratio:.1f}x")
+        print(f"\n⚖️  SKEW ANALYSIS:")
+        print(f"   • File Skew Ratio:      {r.file_skew_ratio:.1f}x")
+        print(f"   • File Skew Severity:   {r.file_skew_severity}")
+        if r.is_partitioned:
+            print(f"   • Partition Skew:       {r.partition_skew_ratio:.1f}x ({r.partition_skew_severity})")
         
-        # Maintenance info
-        print(f"\n🔧 MAINTENANCE STATUS:")
-        print(f"   • Last OPTIMIZE:      {r.last_optimize or 'Never'}")
-        print(f"   • Last VACUUM:        {r.last_vacuum or 'Never'}")
+        # Partition info
+        print(f"\n📊 PARTITIONING:")
+        print(f"   • Is Partitioned:       {r.is_partitioned}")
+        if r.is_partitioned:
+            print(f"   • Partition Columns:    {', '.join(r.partition_columns)}")
+            print(f"   • Partition Count:      {r.partition_count:,}")
+        
+        # Clustering info
+        print(f"\n🔗 CLUSTERING:")
+        print(f"   • Liquid Clustering:    {r.is_liquid_clustered}")
+        if r.is_liquid_clustered:
+            print(f"   • Clustering Columns:   {', '.join(r.clustering_columns)}")
         if r.zorder_columns:
-            print(f"   • ZORDER Columns:     {', '.join(r.zorder_columns)}")
+            print(f"   • ZORDER Columns:       {', '.join(r.zorder_columns)}")
         
-        # Health checks
-        if r.health_checks:
-            failed = [c for c in r.health_checks if c.status == "fail"]
-            warnings = [c for c in r.health_checks if c.status == "warn"]
+        # Maintenance status
+        print(f"\n🔧 MAINTENANCE STATUS:")
+        print(f"   • Last OPTIMIZE:        {r.optimize_status}")
+        print(f"   • Last VACUUM:          {r.vacuum_status}")
+        
+        # Issues
+        if r.issues:
+            print(f"\n⚠️  ISSUES DETECTED ({r.issue_count}):")
+            print(f"   • Critical: {r.critical_issues}, High: {r.high_issues}, Medium: {r.medium_issues}, Low: {r.low_issues}")
+            print()
             
-            print(f"\n🏥 HEALTH STATUS:")
-            if failed:
-                print(f"   ❌ Critical Issues: {len(failed)}")
-                for c in failed:
-                    print(f"      • {c.message}")
-            if warnings:
-                print(f"   ⚠️  Warnings: {len(warnings)}")
-                for c in warnings:
-                    print(f"      • {c.message}")
-            if not failed and not warnings:
-                print(f"   ✅ All checks passed")
-        
-        # Recommendations
-        if r.recommendations_detail:
-            print(f"\n💡 RECOMMENDATIONS:")
-            for i, rec in enumerate(r.recommendations_detail, 1):
-                priority_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(rec.priority, "⚪")
-                print(f"   {i}. [{priority_icon} {rec.priority.upper()}] {rec.title}")
-                print(f"      {rec.description[:100]}...")
-                if rec.sql_command:
-                    print(f"      SQL: {rec.sql_command}")
-        
-        # SQL Commands summary
-        if r.sql_commands:
-            print(f"\n📝 OPTIMIZATION SQL COMMANDS:")
-            for cmd in r.sql_commands:
-                print(f"   {cmd}")
+            for issue in r.issues:
+                severity_icons = {
+                    IssueSeverity.CRITICAL.value: "🔴",
+                    IssueSeverity.HIGH.value: "🟠",
+                    IssueSeverity.MEDIUM.value: "🟡",
+                    IssueSeverity.LOW.value: "🟢"
+                }
+                icon = severity_icons.get(issue.severity, "⚪")
+                
+                print(f"   {icon} [{issue.severity.upper()}] {issue.title}")
+                print(f"      Category: {issue.category}")
+                print(f"      Current:  {issue.current_value}")
+                print(f"      Expected: {issue.threshold}")
+                print(f"      Action:   {issue.recommendation}")
+                if issue.sql_command:
+                    print(f"      SQL:      {issue.sql_command}")
+                print()
+        else:
+            print(f"\n✅ NO ISSUES - Table is well optimized!")
     
     print("\n" + "=" * 80)
     print("END OF REPORT")
@@ -2090,11 +2514,24 @@ results = run_analysis(config)
 
 # COMMAND ----------
 
-# DBTITLE 1,Results DataFrame
+# DBTITLE 1,Results Summary DataFrame
 # Create and display results as a DataFrame
 if results:
     report_df = create_report_dataframe(results)
     display(report_df)
+else:
+    print("No results to display")
+
+# COMMAND ----------
+
+# DBTITLE 1,Issues Detail DataFrame
+# Display detailed issues
+if results:
+    issues_df = create_issues_dataframe(results)
+    if issues_df.count() > 0:
+        display(issues_df)
+    else:
+        print("No issues detected - all tables are healthy!")
 else:
     print("No results to display")
 
@@ -2114,6 +2551,7 @@ print("=" * 60 + "\n")
 for r in results:
     if r.sql_commands:
         print(f"-- Table: {r.full_name}")
+        print(f"-- Health Status: {r.health_status}")
         for cmd in r.sql_commands:
             print(cmd)
         print()
@@ -2140,8 +2578,14 @@ if config.persist_results:
                 table_size_gb,
                 num_files,
                 avg_file_size_mb,
+                small_files_pct,
+                file_skew_severity,
+                is_partitioned,
+                is_liquid_clustered,
+                optimize_status,
+                vacuum_status,
                 health_status,
-                recommendations,
+                issue_count,
                 analysis_timestamp
             FROM {config.get_output_table_name()}
             ORDER BY analysis_timestamp DESC
