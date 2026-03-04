@@ -626,48 +626,6 @@ def get_file_sizes_from_dbutils(table_path: str, sample_size: int = 50000) -> Tu
     return file_sizes, file_infos
 
 
-def get_file_stats_from_delta_log(table_path: str, sample_size: int = 10000) -> List[int]:
-    """
-    Extract file sizes from Delta transaction log (fallback method).
-    
-    This reads the Delta log JSON files to get file sizes without scanning data.
-    Used as a fallback when dbutils.fs.ls is not available.
-    
-    Args:
-        table_path: Path to Delta table
-        sample_size: Maximum number of files to sample for statistics
-        
-    Returns:
-        List of file sizes in bytes
-    """
-    file_sizes = []
-    
-    try:
-        delta_log_path = f"{table_path}/_delta_log"
-        
-        # Read the latest checkpoint or JSON files
-        # Try to read add file statistics from the log
-        log_df = spark.read.json(f"{delta_log_path}/*.json")
-        
-        if "add" in log_df.columns:
-            add_files_df = log_df.select(
-                F.col("add.path").alias("path"),
-                F.col("add.size").alias("size")
-            ).filter(F.col("path").isNotNull())
-            
-            # Sample if there are too many files
-            if add_files_df.count() > sample_size:
-                add_files_df = add_files_df.sample(fraction=sample_size / add_files_df.count())
-            
-            file_sizes = [row.size for row in add_files_df.collect() if row.size is not None]
-            
-    except Exception as e:
-        logger.debug(f"Could not read Delta log for {table_path}: {e}")
-        # Fall back to using DESCRIBE DETAIL average
-    
-    return file_sizes
-
-
 def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, Any]:
     """
     Analyze file layout metrics for a Delta table.
@@ -725,12 +683,13 @@ def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, An
             return result
         
         # PRIMARY METHOD: Use dbutils.fs.ls to get actual file sizes
+        # This is the most reliable method and works with Unity Catalog tables
         file_sizes, file_details = get_file_sizes_from_dbutils(table_path)
         
-        # FALLBACK: If dbutils didn't work, try Delta log
-        if not file_sizes:
-            logger.info("Falling back to Delta log parsing for file sizes")
-            file_sizes = get_file_stats_from_delta_log(table_path)
+        # NOTE: We don't fall back to Delta log parsing because:
+        # 1. Unity Catalog tables may not grant direct file access to _delta_log
+        # 2. Direct S3/ADLS access requires storage credentials that may not be available
+        # If dbutils.fs.ls fails, we use DESCRIBE DETAIL averages (handled below)
         
         # Calculate statistics
         if file_sizes:
@@ -777,14 +736,26 @@ def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, An
                        f"small files: {result['small_files_pct']}%")
         else:
             # If we couldn't get individual file sizes, use DESCRIBE DETAIL averages
+            # This happens when:
+            # 1. dbutils.fs.ls is not available (outside Databricks)
+            # 2. Storage access is restricted (Unity Catalog without external location access)
             avg_size_bytes = total_size_from_detail / num_files_from_detail if num_files_from_detail > 0 else 0
+            avg_size_mb = bytes_to_mb(avg_size_bytes)
+            
             result.update({
                 "total_files": num_files_from_detail,
                 "total_size_bytes": total_size_from_detail,
                 "avg_file_size_bytes": avg_size_bytes,
-                "avg_file_size_mb": bytes_to_mb(avg_size_bytes),
+                "avg_file_size_mb": avg_size_mb,
+                # Use average as estimate for median (not accurate but best we have)
+                "median_file_size_mb": avg_size_mb,
+                # We can still flag small files based on average
+                # If average is small, most files are likely small
+                "small_files_pct": 100.0 if avg_size_mb < config.small_file_acceptable_mb else 0.0,
+                "severe_small_files_pct": 100.0 if avg_size_mb < config.small_file_severe_mb else 0.0,
             })
-            logger.warning(f"Could not get individual file sizes, using averages from DESCRIBE DETAIL")
+            logger.info(f"Using DESCRIBE DETAIL averages (individual file listing not available): "
+                       f"{num_files_from_detail} files, avg size: {avg_size_mb} MB")
         
     except Exception as e:
         result["error"] = str(e)
@@ -898,7 +869,10 @@ def get_partition_sizes(
     sample_limit: int = 1000
 ) -> List[int]:
     """
-    Get approximate partition sizes using file metadata.
+    Get approximate partition sizes using dbutils.fs.ls or DESCRIBE DETAIL estimates.
+    
+    This function avoids direct Delta log access to work with Unity Catalog tables
+    that may have restricted storage access.
     
     Args:
         catalog: Catalog name
@@ -910,49 +884,70 @@ def get_partition_sizes(
     Returns:
         List of partition sizes in bytes
     """
+    full_name = f"{catalog}.{schema}.{table}"
+    
     try:
-        full_name = f"{catalog}.{schema}.{table}"
+        # Get table details
         detail_df = spark.sql(f"DESCRIBE DETAIL {full_name}")
-        location = detail_df.first().location
-        
-        # Read Delta log to get file sizes per partition
-        delta_log_path = f"{location}/_delta_log"
-        
-        try:
-            log_df = spark.read.json(f"{delta_log_path}/*.json")
-            
-            if "add" in log_df.columns:
-                add_df = log_df.select(
-                    F.col("add.path").alias("path"),
-                    F.col("add.size").alias("size"),
-                    F.col("add.partitionValues").alias("partition_values")
-                ).filter(F.col("path").isNotNull())
-                
-                # Group by partition and sum sizes
-                partition_sizes_df = add_df.groupBy("partition_values").agg(
-                    F.sum("size").alias("total_size")
-                ).limit(sample_limit)
-                
-                return [row.total_size for row in partition_sizes_df.collect() if row.total_size]
-        except Exception:
-            pass
-        
-        # Fallback: estimate based on total size and partition count
         detail_row = detail_df.first()
+        location = detail_row.location if detail_row else None
         total_size = detail_row.sizeInBytes if detail_row else 0
         
-        # Get partition count
+        if not location:
+            return []
+        
+        # METHOD 1: Try to use dbutils.fs.ls to get partition directory sizes
+        try:
+            partition_sizes = {}
+            all_items = dbutils.fs.ls(location)
+            
+            for item in all_items:
+                # Skip _delta_log and other metadata
+                if item.name.startswith('_'):
+                    continue
+                
+                # For partitioned tables, directories are partition folders
+                if item.name.endswith('/'):
+                    # List files in this partition to sum sizes
+                    try:
+                        partition_files = dbutils.fs.ls(item.path)
+                        partition_size = sum(
+                            f.size for f in partition_files 
+                            if f.name.endswith('.parquet')
+                        )
+                        if partition_size > 0:
+                            partition_sizes[item.name] = partition_size
+                            
+                        # Stop if we've collected enough partitions
+                        if len(partition_sizes) >= sample_limit:
+                            break
+                    except Exception:
+                        pass
+            
+            if partition_sizes:
+                logger.info(f"Got {len(partition_sizes)} partition sizes using dbutils.fs.ls")
+                return list(partition_sizes.values())
+                
+        except NameError:
+            # dbutils not available
+            pass
+        except Exception as e:
+            logger.debug(f"Could not get partition sizes using dbutils: {e}")
+        
+        # METHOD 2: Estimate based on total size and partition count
         try:
             partitions_df = spark.sql(f"SHOW PARTITIONS {full_name}")
             partition_count = partitions_df.count()
             if partition_count > 0:
                 avg_size = total_size / partition_count
+                # Return estimated sizes (all same since we can't get actual)
+                logger.info(f"Estimating partition sizes from total size: {partition_count} partitions, avg {bytes_to_mb(avg_size)} MB")
                 return [int(avg_size)] * min(partition_count, sample_limit)
         except Exception:
             pass
             
     except Exception as e:
-        logger.debug(f"Error getting partition sizes: {e}")
+        logger.debug(f"Error getting partition sizes for {full_name}: {e}")
     
     return []
 
