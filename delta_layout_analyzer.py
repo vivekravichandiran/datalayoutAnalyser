@@ -626,7 +626,12 @@ def get_file_sizes_from_dbutils(table_path: str, sample_size: int = 50000) -> Tu
     return file_sizes, file_infos
 
 
-def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, Any]:
+def analyze_file_layout(
+    table_path: str, 
+    config: AnalyzerConfig,
+    num_files_from_metadata: int = 0,
+    total_size_from_metadata: int = 0
+) -> Dict[str, Any]:
     """
     Analyze file layout metrics for a Delta table.
     
@@ -647,6 +652,8 @@ def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, An
     Args:
         table_path: Path to the Delta table (from DESCRIBE DETAIL location)
         config: Analyzer configuration
+        num_files_from_metadata: Number of files from DESCRIBE DETAIL (passed from caller)
+        total_size_from_metadata: Total size from DESCRIBE DETAIL (passed from caller)
         
     Returns:
         Dictionary containing file layout statistics
@@ -672,12 +679,10 @@ def analyze_file_layout(table_path: str, config: AnalyzerConfig) -> Dict[str, An
     }
     
     try:
-        # Get basic info from DESCRIBE DETAIL first
-        detail_df = spark.sql(f"DESCRIBE DETAIL delta.`{table_path}`")
-        detail_row = detail_df.first()
-        
-        num_files_from_detail = detail_row.numFiles if detail_row else 0
-        total_size_from_detail = detail_row.sizeInBytes if detail_row else 0
+        # Use metadata passed from caller (already collected via DESCRIBE DETAIL on table name)
+        # This avoids calling DESCRIBE DETAIL delta.`s3://path` which requires direct S3 access
+        num_files_from_detail = num_files_from_metadata
+        total_size_from_detail = total_size_from_metadata
         
         if num_files_from_detail == 0:
             return result
@@ -1926,7 +1931,13 @@ def analyze_table(
         file_skew = {}
         
         if table_path:
-            file_layout = analyze_file_layout(table_path, config)
+            # Pass metadata we already collected to avoid DESCRIBE DETAIL on S3 path
+            file_layout = analyze_file_layout(
+                table_path, 
+                config,
+                num_files_from_metadata=metadata.get("num_files", 0),
+                total_size_from_metadata=metadata.get("table_size_bytes", 0)
+            )
             default_result.file_layout = file_layout
             default_result.avg_file_size_mb = file_layout.get("avg_file_size_mb", 0)
             default_result.small_files_pct = file_layout.get("small_files_pct", 0)
